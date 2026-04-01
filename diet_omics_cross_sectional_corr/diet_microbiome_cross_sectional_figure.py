@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive Figure 6: Microbiome-Diet Correlations
+Comprehensive Figure : Microbiome-Diet Correlations
 - All nutrients (>40)
 - All food groups (~20)
 - diet_cluster (0/1)
