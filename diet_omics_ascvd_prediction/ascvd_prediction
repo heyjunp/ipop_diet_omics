@@ -1,0 +1,261 @@
+library(glmnet); library(dplyr); library(caret)
+library(missForest); library(ranger)
+library(ggplot2); library(gridExtra)
+library(pdp); library(iml)
+
+data_dir <- "../data"
+fig_dir  <- "Figures"
+if (!dir.exists(fig_dir)) dir.create(fig_dir)
+
+ascvd <- read.csv(file.path(data_dir, "ascvd_merged_data_cleaned.csv"),
+                  header = TRUE, quote = "\"", skipNul = TRUE,
+                  na.strings = c(NA, " "))
+
+### violin plot
+ascvd$aha10risk_pct <- ascvd$aha10risk * 100
+ascvd_overall <- subset(ascvd, !is.na(aha10risk_pct))
+
+beige <- "#993300"
+p_violin <- ggplot(ascvd_overall, aes(y = "", x = aha10risk_pct)) +
+  geom_violin(fill = beige, color = beige, linewidth = 2, trim = FALSE) +
+  geom_boxplot(width = 0.2, outlier.size = 3, alpha = 0.9,
+               color = "gray30", linewidth = 1.2, fill = "white") +
+  labs(x = "10-Year ASCVD Risk Score (%)", y = "") +
+  theme_classic(base_size = 50) +
+  theme(axis.text.y  = element_blank(), axis.ticks.y = element_blank(),
+        axis.title.x = element_text(size = 55, margin = ggplot2::margin(t = 20)),
+        plot.margin  = ggplot2::margin(40, 40, 40, 40))
+
+ggsave(file.path(fig_dir, "ascvd_violin_overall.png"),
+       p_violin, width = 30, height = 20, units = "in", dpi = 300)
+
+
+######################
+## prep predictors
+y <- ascvd$aha10risk
+ascvd$Sex <- ifelse(ascvd$Sex == "F", 0, 1)
+ascvd$RaceEth <- factor(ascvd$RaceEth,
+                        levels = c("eur", "his", "eas", "aa", "sas", "jewish"))
+X_raw <- ascvd[, !colnames(ascvd) %in% "aha10risk"]
+
+set.seed(163)
+imp <- missForest(X_raw)
+X_imp <- imp$ximp
+if (!is.factor(X_imp$RaceEth))
+  X_imp$RaceEth <- factor(X_imp$RaceEth,
+                           levels = c("eur", "his", "eas", "aa", "sas", "jewish"))
+
+X <- model.matrix(~ ., data = X_imp)[, -1]
+yy <- y
+
+cm <- cor(X, use = "pairwise.complete.obs")
+hi <- findCorrelation(cm, cutoff = 0.9)
+if (length(hi) > 0) X <- X[, -hi]
+
+
+######## nested CV: EN vs RF ########
+set.seed(163)
+K <- 5
+folds <- createFolds(yy, k = K, list = TRUE, returnTrain = FALSE)
+en_rmse <- rf_rmse <- numeric(K)
+
+for (i in 1:K) {
+  cat("fold", i, "\n")
+  te <- folds[[i]]; tr <- unlist(folds[-i])
+
+  Xtr <- X[tr, , drop = FALSE]; ytr <- yy[tr]
+  Xte <- X[te, , drop = FALSE]; yte <- yy[te]
+
+  # lasso selection
+  lam_seq <- 10^seq(-6, 0, length.out = 200)
+  cvl <- cv.glmnet(as.matrix(Xtr), ytr, alpha = 1, nfolds = 5, lambda = lam_seq)
+  lmod <- glmnet(as.matrix(Xtr), ytr, alpha = 1, lambda = cvl$lambda.min)
+  cf <- as.matrix(coef(lmod, s = cvl$lambda.min))
+  sel <- which(abs(cf[-1, 1]) > 0.001)
+  sn <- colnames(Xtr)[sel]
+  if (length(sn) < 15) {
+    sel <- order(abs(cf[-1, 1]), decreasing = TRUE)[1:15]
+    sn <- colnames(Xtr)[sel]
+  }
+
+  Xtr_s <- Xtr[, sn, drop = FALSE]
+  Xte_s <- Xte[, sn, drop = FALSE]
+  ctrl <- trainControl(method = "cv", number = 5)
+
+  ### EN
+  en_g <- expand.grid(alpha = c(0.1, 0.5, 0.9),
+                      lambda = seq(0.001, 0.1, length.out = 5))
+  en_m <- train(x = Xtr_s, y = ytr, method = "glmnet",
+                trControl = ctrl, tuneGrid = en_g)
+
+  ### RF
+  rf_g <- expand.grid(mtry = c(floor(sqrt(ncol(Xtr_s))), floor(ncol(Xtr_s) / 3)),
+                      min.node.size = 5, splitrule = "variance")
+  rf_m <- train(x = Xtr_s, y = ytr, method = "ranger",
+                trControl = ctrl, tuneGrid = rf_g,
+                num.trees = 200, importance = "impurity")
+
+  en_rmse[i] <- sqrt(mean((predict(en_m, Xte_s) - yte)^2))
+  rf_rmse[i] <- sqrt(mean((predict(rf_m, Xte_s) - yte)^2))
+}
+
+cat("EN:", mean(en_rmse), "RF:", mean(rf_rmse), "\n")
+print(t.test(en_rmse, rf_rmse, paired = TRUE))
+
+png(file.path(fig_dir, "RMSE_EN_RF.png"), width = 10, height = 8, units = "in", res = 300)
+boxplot(list(Elastic_Net = en_rmse, Random_Forest = rf_rmse),
+        main = "RMSE Comparison", ylab = "RMSE")
+dev.off()
+
+######################################
+###### final models (full data) ######
+######################################
+set.seed(163)
+lam_seq <- 10^seq(-6, 0, length.out = 200)
+cvl_f <- cv.glmnet(as.matrix(X), yy, alpha = 1, nfolds = 5, lambda = lam_seq)
+lmod_f <- glmnet(as.matrix(X), yy, alpha = 1, lambda = cvl_f$lambda.min)
+
+cf_f <- as.matrix(coef(lmod_f, s = cvl_f$lambda.min))
+sel_f <- which(abs(cf_f[-1, 1]) > 0.001)
+sn_f <- colnames(X)[sel_f]
+if (length(sel_f) < 15) {
+  sel_f <- order(abs(cf_f[-1, 1]), decreasing = TRUE)[1:15]
+  sn_f <- colnames(X)[sel_f]
+}
+Xsel <- X[, sn_f, drop = FALSE]
+
+## EN final
+ctrl_f <- trainControl(method = "cv", number = 5)
+en_gf <- expand.grid(alpha  = seq(0, 1, length.out = 20),
+                     lambda = exp(seq(log(0.0001), log(1), length.out = 50)))
+en_f <- train(x = Xsel, y = yy, method = "glmnet",
+              trControl = ctrl_f, tuneGrid = en_gf)
+
+en_coef <- coef(en_f$finalModel, en_f$bestTune$lambda)
+en_imp <- data.frame(feature = rownames(en_coef)[-1],
+                     importance = abs(as.vector(en_coef)[-1]))
+en_imp <- en_imp[order(-en_imp$importance), ]
+en_imp <- en_imp[1:min(20, nrow(en_imp)), ]
+
+en_effects <- data.frame(Feature = rownames(en_coef)[-1],
+                         Coefficient = as.vector(en_coef)[-1])
+en_effects <- en_effects[order(-abs(en_effects$Coefficient)), ]
+write.csv(en_effects, file.path(fig_dir, "en_features_effects.csv"), row.names = FALSE)
+
+## RF final
+set.seed(123)
+rf_gf <- expand.grid(mtry = c(floor(sqrt(ncol(Xsel))), floor(ncol(Xsel) / 3)),
+                     min.node.size = c(5, 10), splitrule = "variance")
+rf_f <- train(x = Xsel, y = yy, method = "ranger",
+              trControl = trainControl(method = "cv", number = 5),
+              tuneGrid = rf_gf, num.trees = 500, importance = "impurity")
+
+rf_vi <- varImp(rf_f, scale = FALSE)
+rf_imp <- data.frame(feature = rownames(rf_vi$importance),
+                     importance = rf_vi$importance$Overall, row.names = NULL)
+rf_imp <- rf_imp[order(-rf_imp$importance), ]
+rf_imp <- rf_imp[1:min(20, nrow(rf_imp)), ]
+write.csv(rf_imp, file.path(fig_dir, "rf_feature_importance.csv"), row.names = FALSE)
+
+# grey importance plots
+p_en <- ggplot(en_imp, aes(x = reorder(feature, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "grey60") + coord_flip() +
+  labs(title = "Top Predictors (Elastic Net)", x = "Features", y = "Absolute Coefficient") +
+  theme_minimal()
+
+p_rf <- ggplot(rf_imp, aes(x = reorder(feature, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "grey60") + coord_flip() +
+  labs(title = "Top Predictors (Random Forest)", x = "Features", y = "Importance") +
+  theme_minimal()
+
+ggsave(file.path(fig_dir, "Predictors_ASCVD_Elastic_Net.png"),
+       p_en, width = 6, height = 6, units = "in", dpi = 300)
+ggsave(file.path(fig_dir, "Predictors_ASCVD_Random_Forest.png"),
+       p_rf, width = 6, height = 6, units = "in", dpi = 300)
+
+p_both <- grid.arrange(p_en, p_rf, ncol = 2, top = "Top Predictors for ASCVD Risk")
+ggsave(file.path(fig_dir, "Predictors_ASCVD_Both_Models.png"),
+       p_both, width = 12, height = 6, units = "in", dpi = 300)
+
+
+######## PDP + ICE ########
+Xsel_df <- as.data.frame(Xsel)
+pred_obj <- Predictor$new(model = rf_f, data = Xsel_df, y = yy)
+top_feat <- head(rf_imp$feature, 20)
+
+mk_pdp <- function(feat) {
+  pd <- as.data.frame(partial(rf_f, pred.var = feat, train = Xsel_df, plot = FALSE))
+  yc <- setdiff(names(pd), feat)[1]
+  ggplot(pd, aes_string(x = feat, y = yc)) +
+    geom_line() + geom_rug(sides = "b") +
+    labs(title = feat, y = "Predicted ASCVD risk") + theme_minimal()
+}
+mk_ice <- function(feat) {
+  eff <- FeatureEffect$new(pred_obj, feature = feat, method = "pdp+ice")
+  eff$plot() + labs(title = feat) + theme_minimal()
+}
+
+pdp_plots <- lapply(top_feat, mk_pdp)
+ice_plots <- lapply(top_feat, mk_ice)
+
+ggsave(file.path(fig_dir, "combined_pdp_plots.png"),
+       grid.arrange(grobs = pdp_plots, ncol = 4), width = 30, height = 20, units = "in")
+ggsave(file.path(fig_dir, "combined_ice_plots.png"),
+       grid.arrange(grobs = ice_plots, ncol = 4), width = 30, height = 20, units = "in")
+
+
+##### colored plots #####
+
+en_csv <- read.csv(file.path(fig_dir, "en_features_effects.csv"))
+rf_csv <- read.csv(file.path(fig_dir, "rf_feature_importance.csv"))
+
+en_csv <- en_csv %>% mutate(abs_coef = abs(Coefficient)) %>%
+  arrange(desc(abs_coef)) %>% slice(1:20)
+rf_csv <- rf_csv %>% arrange(desc(importance)) %>% slice(1:20)
+
+dir_tbl <- data.frame(
+  Feature = c("Age", "PDGFBB", "pHILIC_290.1594_11", "nHILIC_399.0965_7.8",
+              "class_Bacilli", "order_Selenomonadales", "class_Negativicutes",
+              "RDW", "Sex", "Cu",
+              "TotFib", "Seafood", "pHILIC_160.0615_10.7",
+              "phylum_unclassified_Bacteria", "class_unclassified_Bacteria"),
+  dir = c(rep("Adverse", 9), "Protective", rep("Mixed", 5)),
+  stringsAsFactors = FALSE
+)
+
+dcols <- c("Adverse" = "#B3504B", "Protective" = "#CEDEAB", "Mixed" = "#7DA9C3")
+
+en_pd <- en_csv %>% left_join(dir_tbl, by = "Feature") %>%
+  mutate(dir = ifelse(is.na(dir), "Mixed", dir))
+rf_pd <- rf_csv %>% left_join(dir_tbl, by = c("feature" = "Feature")) %>%
+  mutate(dir = ifelse(is.na(dir), "Mixed", dir))
+
+p_en_c <- ggplot(en_pd, aes(x = reorder(Feature, abs_coef), y = abs_coef, fill = dir)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = dcols, name = "Prediction Direction") + coord_flip() +
+  labs(title = "Top Predictors for ASCVD Risk (Elastic Net)",
+       x = "Features", y = "Absolute Coefficient") +
+  theme_minimal() +
+  theme(panel.background = element_rect(fill = "white", color = NA),
+        plot.background  = element_rect(fill = "white", color = NA))
+
+p_rf_c <- ggplot(rf_pd, aes(x = reorder(feature, importance), y = importance, fill = dir)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = dcols, name = "Prediction Direction") + coord_flip() +
+  labs(title = "Top Predictors for ASCVD Risk (Random Forest)",
+       x = "Features", y = "Importance") +
+  theme_minimal() +
+  theme(panel.background = element_rect(fill = "white", color = NA),
+        plot.background  = element_rect(fill = "white", color = NA))
+
+ggsave(file.path(fig_dir, "Predictors_ASCVD_Elastic_Net_color.png"),
+       p_en_c, width = 6, height = 6, units = "in", dpi = 300)
+ggsave(file.path(fig_dir, "Predictors_ASCVD_Random_Forest_color.png"),
+       p_rf_c, width = 6, height = 4, units = "in", dpi = 300)
+ggsave(file.path(fig_dir, "Predictors_ASCVD_Random_Forest_color.pdf"),
+       p_rf_c, width = 6.72, height = 4, units = "in")
+
+p_both_c <- grid.arrange(p_en_c, p_rf_c, ncol = 2,
+                         top = "Top Predictors for ASCVD Risk (Color-coded)")
+ggsave(file.path(fig_dir, "Predictors_ASCVD_Both_Models_color.png"),
+       p_both_c, width = 12, height = 6, units = "in", dpi = 300)
