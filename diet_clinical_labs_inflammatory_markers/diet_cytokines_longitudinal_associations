@@ -1,0 +1,222 @@
+library(tidyverse); library(lme4); library(lmerTest); library(emmeans)
+
+data_dir <- "../../Diet_Data/Clean_Data"
+cytokines_raw <- read.csv(file.path(data_dir, "cytokines.csv"), stringsAsFactors = FALSE)
+demo_raw      <- read.csv(file.path(data_dir, "df_b_demographics.csv"), stringsAsFactors = FALSE)
+diet_raw      <- read.csv(file.path(data_dir, "diet_clusters_ae801.csv"), stringsAsFactors = FALSE)
+annot_raw     <- read.csv(file.path(data_dir, "cytokines_annotation.csv"), stringsAsFactors = FALSE)
+
+cytokines_clean <- cytokines_raw %>%
+  filter(!is.na(SubjectID), !is.na(Time), Time != "", Time != "NA")
+
+demo_keep <- demo_raw %>%
+  select(SubjectID, SSPG, Sex, Age, RaceEth, Baseline.BMI)
+
+diet_keep <- diet_raw %>%
+  select(SubjectID, diet_cluster)
+
+analysis_df <- cytokines_clean %>%
+  left_join(demo_keep, by = "SubjectID") %>%
+  left_join(diet_keep, by = "SubjectID") %>%
+  mutate(
+    SSPG = as.numeric(SSPG),
+    diet_cluster = factor(diet_cluster),
+    Sex = factor(Sex),
+    RaceEth = factor(RaceEth)
+  )
+
+cytokine_vars <- intersect(annot_raw$cytokine, names(analysis_df))
+
+cytokine_long <- analysis_df %>%
+  pivot_longer(
+    cols = all_of(cytokine_vars),
+    names_to = "cytokine",
+    values_to = "value"
+  ) %>%
+  left_join(annot_raw, by = c("cytokine" = "cytokine"))
+
+fit_one_marker <- function(df_marker) {
+
+  df_marker <- df_marker %>%
+    filter(
+      !is.na(value),
+      value > 0,
+      !is.na(SSPG),
+      !is.na(diet_cluster)
+    )
+
+  # Skip markers with too little usable data
+  if (nrow(df_marker) < 10) return(NULL)
+  if (n_distinct(df_marker$value) < 3) return(NULL)
+
+  model_fit <- try(
+    lmer(
+      log(value) ~ SSPG * diet_cluster + Sex + Age + RaceEth + Baseline.BMI + (1 | SubjectID),
+      data = df_marker,
+      REML = FALSE
+    ),
+    silent = TRUE
+  )
+
+  if (inherits(model_fit, "try-error")) return(NULL)
+
+  anova_df <- anova(model_fit, type = 3) %>%
+    as.data.frame()
+
+  anova_df$term <- rownames(anova_df)
+
+  if ("F.value" %in% names(anova_df)) {
+    anova_df <- anova_df %>% rename(stat_value = F.value)
+    p_col <- "Pr(>F)"
+  } else if ("F value" %in% names(anova_df)) {
+    anova_df <- anova_df %>% rename(stat_value = `F value`)
+    p_col <- "Pr(>F)"
+  } else if ("Chisq" %in% names(anova_df)) {
+    anova_df <- anova_df %>% rename(stat_value = Chisq)
+    p_col <- "Pr(>Chisq)"
+  } else {
+    anova_df$stat_value <- NA_real_
+    p_col <- NA_character_
+  }
+
+  if (!is.na(p_col) && p_col %in% names(anova_df)) {
+    effect_table <- anova_df %>%
+      transmute(term, stat_value, p_value = .data[[p_col]])
+  } else {
+    effect_table <- anova_df %>%
+      transmute(term, stat_value, p_value = NA_real_)
+  }
+
+  sspg_points <- quantile(df_marker$SSPG, probs = c(0.25, 0.50, 0.75), na.rm = TRUE)
+
+  emm_table <- try(
+    emmeans(
+      model_fit,
+      ~ diet_cluster | SSPG,
+      at = list(SSPG = as.numeric(sspg_points))
+    ) %>%
+      as.data.frame() %>%
+      rename(estimate = emmean) %>%
+      mutate(
+        group_type = "diet_by_SSPG",
+        group_label = paste0("DP", diet_cluster, "_SSPG_", SSPG)
+      ),
+    silent = TRUE
+  )
+
+  if (inherits(emm_table, "try-error")) {
+    emm_table <- NULL
+  }
+
+  list(
+    effects = effect_table,
+    emmeans = emm_table
+  )
+}
+
+marker_list <- split(cytokine_long, cytokine_long$cytokine)
+
+effect_results <- vector("list", length(marker_list))
+emmeans_results <- vector("list", length(marker_list))
+
+for (i in seq_along(marker_list)) {
+  marker_name <- names(marker_list)[i]
+  marker_out <- fit_one_marker(marker_list[[i]])
+
+  if (is.null(marker_out)) next
+
+  effect_results[[i]] <- marker_out$effects %>%
+    mutate(cytokine = marker_name)
+
+  if (!is.null(marker_out$emmeans)) {
+    emmeans_results[[i]] <- marker_out$emmeans %>%
+      mutate(cytokine = marker_name)
+  }
+}
+
+effects_all <- bind_rows(effect_results)
+emmeans_all <- bind_rows(emmeans_results)
+
+effects_fdr <- effects_all %>%
+  filter(term %in% c("SSPG", "diet_cluster", "SSPG:diet_cluster")) %>%
+  group_by(term) %>%
+  mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+  ungroup()
+
+qval_table <- effects_fdr %>%
+  select(cytokine, term, p_adj_BH) %>%
+  mutate(
+    term = recode(
+      term,
+      "SSPG" = "q_sspg_cont",
+      "diet_cluster" = "q_diet",
+      "SSPG:diet_cluster" = "q_interaction"
+    )
+  ) %>%
+  pivot_wider(names_from = term, values_from = p_adj_BH)
+
+sig_interaction_markers <- qval_table %>%
+  filter(!is.na(q_interaction), q_interaction < 0.20) %>%
+  arrange(q_interaction) %>%
+  pull(cytokine)
+
+### Plot selected markers
+markers_to_plot <- c("LEPTIN", "VEGFD")
+
+plot_df <- cytokine_long %>%
+  filter(
+    cytokine %in% markers_to_plot,
+    !is.na(value),
+    value > 0
+  )
+
+diet_colors <- c("DP0" = "#2C7FB8", "DP1" = "#F1A226")
+
+p <- ggplot(plot_df, aes(x = SSPG, y = log(value))) +
+  geom_point(aes(color = paste0("DP", diet_cluster)), alpha = 0.6) +
+  geom_smooth(
+    aes(
+      color = paste0("DP", diet_cluster),
+      fill = paste0("DP", diet_cluster)
+    ),
+    method = "lm",
+    se = TRUE,
+    fullrange = TRUE
+  ) +
+  facet_wrap(~ cytokine, scales = "free_y") +
+  scale_color_manual(values = diet_colors) +
+  scale_fill_manual(values = diet_colors) +
+  labs(
+    x = "SSPG",
+    y = "log(Cytokine)",
+    color = "Diet Pattern",
+    fill = "Diet Pattern"
+  ) +
+  theme_bw() +
+  theme(
+    strip.background = element_rect(fill = "white", color = "black"),
+    strip.text = element_text(face = "bold", size = 14),
+    axis.title.x = element_text(size = 17),
+    axis.title.y = element_text(size = 17),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14),
+    legend.text = element_text(size = 17),
+    legend.title = element_text(size = 17)
+  )
+
+if (!dir.exists("Figures")) dir.create("Figures")
+
+ggsave(
+  "Figures/LEPTIN_VEGFD_SSPG_interaction.png",
+  p,
+  width = 10,
+  height = 5,
+  dpi = 300)
+
+ggsave(
+  "Figures/LEPTIN_VEGFD_SSPG_interaction.pdf",
+  p,
+  width = 10,
+  height = 5)
+
+sessionInfo()
