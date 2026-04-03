@@ -1,0 +1,289 @@
+library(tidyverse); library(lme4); library(lmerTest); library(emmeans)
+library(ComplexHeatmap); library(circlize); library(grid); library(stringr)
+
+data_dir <- "../../Diet_Data/Clean_Data"
+clinic_raw <- read.csv(file.path(data_dir, "clinic.csv"), stringsAsFactors = FALSE)
+demo_raw   <- read.csv(file.path(data_dir, "df_b_demographics.csv"), stringsAsFactors = FALSE)
+diet_raw   <- read.csv(file.path(data_dir, "diet_clusters_ae801.csv"), stringsAsFactors = FALSE)
+annot_raw  <- read.csv(file.path(data_dir, "clinic_annotation.csv"), stringsAsFactors = FALSE)
+
+clinic_raw <- rename(clinic_raw, K = K_clinic)
+annot_raw$clinic[is.na(annot_raw$clinic)] <- "NA."
+
+clinic_clean <- clinic_raw %>%
+  filter(!is.na(SubjectID), !is.na(Time), Time != "", Time != "NA")
+
+demo_keep <- demo_raw %>%
+  select(SubjectID, sspg_status, Sex, Age, RaceEth, Baseline.BMI)
+
+diet_keep <- diet_raw %>%
+  select(SubjectID, diet_cluster)
+
+analysis_df <- clinic_clean %>%
+  left_join(demo_keep, by = "SubjectID") %>%
+  left_join(diet_keep, by = "SubjectID") %>%
+  mutate(
+    sspg_status  = factor(sspg_status),
+    diet_cluster = factor(diet_cluster),
+    Sex          = factor(Sex),
+    RaceEth      = factor(RaceEth)
+  )
+
+lab_vars <- intersect(annot_raw$clinic, names(analysis_df))
+
+lab_long <- analysis_df %>%
+  pivot_longer(
+    cols      = all_of(lab_vars),
+    names_to  = "lab",
+    values_to = "value"
+  ) %>%
+  left_join(annot_raw, by = c("lab" = "clinic"))
+
+###########################
+# LME function
+###########################
+fit_one_lab <- function(df_lab) {
+
+  df_lab <- df_lab %>%
+    filter(!is.na(value), value > 0)
+
+  if (nrow(df_lab) < 10) return(NULL)
+  if (n_distinct(df_lab$value) < 3) return(NULL)
+
+  model_fit <- try(
+    lmer(
+      log(value) ~ sspg_status * diet_cluster + Sex + Age + RaceEth + Baseline.BMI + (1 | SubjectID),
+      data = df_lab,
+      REML = FALSE
+    ),
+    silent = TRUE
+  )
+  if (inherits(model_fit, "try-error")) return(NULL)
+
+  anova_df <- anova(model_fit, type = 3) %>% as.data.frame()
+  anova_df$term <- rownames(anova_df)
+
+  if ("F.value" %in% names(anova_df)) {
+    anova_df <- anova_df %>% rename(stat_value = F.value)
+  } else if ("F value" %in% names(anova_df)) {
+    anova_df <- anova_df %>% rename(stat_value = `F value`)
+  } else if ("Chisq" %in% names(anova_df)) {
+    anova_df <- anova_df %>% rename(stat_value = Chisq)
+  } else {
+    anova_df$stat_value <- NA_real_
+  }
+
+  effect_table <- anova_df %>%
+    select(term, stat_value, p_value = `Pr(>F)`)
+
+  ### EMM extraction 
+  safe_emm <- function(formula_obj) {
+    out <- try(emmeans(model_fit, formula_obj), silent = TRUE)
+    if (inherits(out, "try-error")) return(NULL)
+    df_out <- try(as.data.frame(out), silent = TRUE)
+    if (inherits(df_out, "try-error")) return(NULL)
+    if ("emmean" %in% names(df_out)) {
+      df_out <- df_out %>% rename(estimate = emmean)
+    } else if (!"estimate" %in% names(df_out)) {
+      return(NULL)
+    }
+    df_out
+  }
+
+  emm_sspg <- safe_emm(~ sspg_status)
+  emm_diet <- safe_emm(~ diet_cluster)
+  emm_int  <- safe_emm(~ sspg_status * diet_cluster)
+
+  if (is.null(emm_sspg) && is.null(emm_diet) && is.null(emm_int)) return(NULL)
+
+  if (!is.null(emm_sspg)) {
+    emm_sspg <- emm_sspg %>%
+      mutate(group_type = "sspg_main",
+             group_label = as.character(sspg_status))
+  }
+  if (!is.null(emm_diet)) {
+    emm_diet <- emm_diet %>%
+      mutate(group_type = "diet_main",
+             group_label = paste0("DP", diet_cluster))
+  }
+  if (!is.null(emm_int)) {
+    emm_int <- emm_int %>%
+      mutate(group_type = "sspg_by_diet",
+             group_label = paste(sspg_status, paste0("DP", diet_cluster), sep = "_"))
+  }
+
+  list(
+    effects = effect_table,
+    emmeans = bind_rows(emm_sspg, emm_diet, emm_int)
+  )
+}
+
+###########################
+# Loop over labs
+###########################
+lab_list <- split(lab_long, lab_long$lab)
+
+effect_results  <- vector("list", length(lab_list))
+emmeans_results <- vector("list", length(lab_list))
+
+for (i in seq_along(lab_list)) {
+  lab_name <- names(lab_list)[i]
+  lab_out  <- fit_one_lab(lab_list[[i]])
+
+  if (is.null(lab_out)) next
+
+  effect_results[[i]]  <- lab_out$effects %>% mutate(lab = lab_name)
+  emmeans_results[[i]] <- lab_out$emmeans %>% mutate(lab = lab_name)
+}
+
+effects_all <- bind_rows(effect_results)
+emmeans_all <- bind_rows(emmeans_results)
+
+###########################
+### FDR correction
+###########################
+effects_fdr <- effects_all %>%
+  filter(term %in% c("sspg_status", "diet_cluster", "sspg_status:diet_cluster")) %>%
+  mutate(p_adj_BH = p.adjust(p_value, method = "BH"))
+
+qval_table <- effects_fdr %>%
+  select(lab, term, p_adj_BH) %>%
+  mutate(
+    term = recode(term,
+                  "sspg_status"              = "q_sspg",
+                  "diet_cluster"             = "q_diet",
+                  "sspg_status:diet_cluster" = "q_combo")
+  ) %>%
+  pivot_wider(names_from = term, values_from = p_adj_BH)
+
+###########################
+# Heatmap matrix from EMMs
+###########################
+desired_order <- c("IR", "IS", "DP0", "DP1",
+                   "IS_DP0", "IS_DP1", "IR_DP0", "IR_DP1")
+
+heat_df <- emmeans_all %>%
+  select(lab, group_label, estimate) %>%
+  filter(group_label %in% desired_order) %>%
+  mutate(group_label = factor(group_label, levels = desired_order)) %>%
+  arrange(group_label) %>%
+  pivot_wider(names_from = lab, values_from = estimate)
+
+heat_mat <- as.matrix(heat_df[, -1])
+rownames(heat_mat) <- heat_df$group_label
+
+# Z-score per lab
+heat_mat_z <- scale(heat_mat, center = TRUE, scale = TRUE)
+
+###########################
+# Domain annotation
+###########################
+annot_col_df <- annot_raw %>%
+  filter(clinic %in% colnames(heat_mat_z)) %>%
+  group_by(clinic) %>%
+  summarise(domain = paste(unique(classification), collapse = "/"), .groups = "drop") %>%
+  rename(lab = clinic) %>%
+  column_to_rownames("lab")
+
+annot_col_df$domain <- str_trim(annot_col_df$domain)
+
+###########################
+# Significance symbol matrix
+###########################
+alpha <- 0.20
+star_mat <- matrix("", nrow = nrow(heat_mat_z), ncol = ncol(heat_mat_z),
+                   dimnames = dimnames(heat_mat_z))
+
+for (j in seq_len(ncol(heat_mat_z))) {
+  lab_name <- colnames(heat_mat_z)[j]
+  pv_row <- qval_table %>% filter(lab == lab_name)
+  if (nrow(pv_row) == 0) next
+
+  # * for SSPG (IS vs IR)
+  if (!is.na(pv_row$q_sspg) && pv_row$q_sspg < alpha) {
+    if ("IR" %in% rownames(heat_mat_z)) star_mat["IR", lab_name] <- paste0(star_mat["IR", lab_name], "*")
+    if ("IS" %in% rownames(heat_mat_z)) star_mat["IS", lab_name] <- paste0(star_mat["IS", lab_name], "*")
+  }
+
+  # # for diet cluster (DP0 vs DP1)
+  if (!is.na(pv_row$q_diet) && pv_row$q_diet < alpha) {
+    if ("DP0" %in% rownames(heat_mat_z)) star_mat["DP0", lab_name] <- paste0(star_mat["DP0", lab_name], "#")
+    if ("DP1" %in% rownames(heat_mat_z)) star_mat["DP1", lab_name] <- paste0(star_mat["DP1", lab_name], "#")
+  }
+
+  # + for interaction
+  if (!is.na(pv_row$q_combo) && pv_row$q_combo < alpha) {
+    combo_rows <- intersect(c("IS_DP0", "IS_DP1", "IR_DP0", "IR_DP1"), rownames(heat_mat_z))
+    for (r in combo_rows) {
+      star_mat[r, lab_name] <- paste0(star_mat[r, lab_name], "+")
+    }
+  }
+}
+
+###########################
+# Heatmap plot
+###########################
+domain_map   <- annot_col_df %>% rownames_to_column("lab") %>% select(lab, domain)
+ordered_labs <- domain_map %>% arrange(domain, lab) %>% pull(lab)
+
+heat_mat_z2   <- heat_mat_z[, ordered_labs]
+annot_col_df2 <- annot_col_df[ordered_labs, , drop = FALSE]
+star_mat2     <- star_mat[, ordered_labs]
+star_mat2[star_mat2 == ""] <- NA
+
+my_domain_cols <- c(
+  "Electrolytes"       = "#00CED1",
+  "Glucose Regulation" = "#9ACD32",
+  "Hematologic"        = "#DA70D6",
+  "Hepatic"            = "#FF69B4",
+  "Immune"             = "#DAA520",
+  "Immune/Renal"       = "#3CB371",
+  "Lipid Panel"        = "#1E90FF",
+  "Renal"              = "#FF7F7F"
+)
+
+col_fun <- colorRamp2(
+  seq(-1.5, 1.5, length.out = 7),
+  c("#4575B4", "#91BFDB", "#E0F3F8", "#FFFFBF", "#FEE090", "#FC8D59", "#D73027")
+)
+
+ha <- HeatmapAnnotation(
+  domain = annot_col_df2$domain,
+  col = list(domain = my_domain_cols),
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(0.6, "cm")
+)
+
+ht <- Heatmap(
+  heat_mat_z2,
+  name = "z-score",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  top_annotation = ha,
+  column_split = annot_col_df2$domain,
+  row_names_side = "left",
+  column_names_rot = 90,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (!is.na(star_mat2[i, j])) {
+      grid.text(star_mat2[i, j], x, y,
+                gp = gpar(fontsize = 14, fontface = "bold"))
+    }
+  },
+  heatmap_legend_param = list(
+    title = "z-score",
+    legend_height = unit(4, "cm")
+  )
+)
+
+if (!dir.exists("Figures")) dir.create("Figures")
+
+pdf("Figures/heatmap_clinical_labs.pdf", width = 16, height = 4)
+draw(ht, heatmap_legend_side = "right", annotation_legend_side = "left", merge_legends = FALSE)
+dev.off()
+
+png("Figures/heatmap_clinical_labs.png", width = 2800, height = 750, res = 300, bg = "white")
+draw(ht, heatmap_legend_side = "right", annotation_legend_side = "left", merge_legends = FALSE)
+dev.off()
+
+sessionInfo()
