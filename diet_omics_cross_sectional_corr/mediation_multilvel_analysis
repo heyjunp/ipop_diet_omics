@@ -1,0 +1,108 @@
+library(dplyr); library(sandwich); library(lmtest)
+
+input_dir  <- "../mediation_analysis"
+output_dir <- "../mediation_analysis"
+
+data <- read.csv(file.path(input_dir, "mediation_multilevel_data_merged_sample_level_data.csv"), check.names = FALSE)
+mediation_combos <- read.csv(file.path(input_dir, "mediation_multilevel_data_diet_microbe_metabolite_combinations.csv"))
+
+nrow(data) # 101 observations
+length(unique(data$SubjectID)) # 55 subjects
+nrow(mediation_combos) # 313 combinations
+
+### Mediation function (Sobel test + cluster-robust SE)
+run_mediation <- function(data, x_var, m_var, y_var) {
+
+  vars <- c(x_var, m_var, y_var, "SubjectID", "Age", "Sex_numeric")
+  df <- data[complete.cases(data[, vars]), vars]
+
+  if (nrow(df) < 20 || length(unique(df$SubjectID)) < 10) return(NULL)
+
+  if (min(df[[m_var]], na.rm = TRUE) >= 0) df[[m_var]] <- log1p(df[[m_var]])
+  if (min(df[[y_var]], na.rm = TRUE) >= 0) df[[y_var]] <- log1p(df[[y_var]])
+
+  if (sd(df[[m_var]], na.rm = TRUE) < 1e-10 || sd(df[[y_var]], na.rm = TRUE) < 1e-10) return(NULL)
+
+  result <- tryCatch({
+    # Path a: X -> M
+    fit_a <- lm(as.formula(paste0("`", m_var, "` ~ `", x_var, "` + Age + Sex_numeric")), data = df)
+    ct_a <- coeftest(fit_a, vcov. = vcovCL(fit_a, cluster = df$SubjectID, type = "HC1"))
+    a <- ct_a[2, "Estimate"]; se_a <- ct_a[2, "Std. Error"]; p_a <- ct_a[2, "Pr(>|t|)"]
+
+    # Path b: M -> Y | X
+    fit_b <- lm(as.formula(paste0("`", y_var, "` ~ `", m_var, "` + `", x_var, "` + Age + Sex_numeric")), data = df)
+    ct_b <- coeftest(fit_b, vcov. = vcovCL(fit_b, cluster = df$SubjectID, type = "HC1"))
+    b <- ct_b[2, "Estimate"]; se_b <- ct_b[2, "Std. Error"]; p_b <- ct_b[2, "Pr(>|t|)"]
+    c_prime <- ct_b[3, "Estimate"]; p_cprime <- ct_b[3, "Pr(>|t|)"]
+
+    #Total: X -> Y
+    fit_t <- lm(as.formula(paste0("`", y_var, "` ~ `", x_var, "` + Age + Sex_numeric")), data = df)
+    ct_t <- coeftest(fit_t, vcov. = vcovCL(fit_t, cluster = df$SubjectID, type = "HC1"))
+    c_total <- ct_t[2, "Estimate"]; p_total <- ct_t[2, "Pr(>|t|)"]
+
+    # Sobel test
+    indirect <- a * b
+    se_indirect <- sqrt(a^2 * se_b^2 + b^2 * se_a^2)
+    z <- indirect / se_indirect
+    p_indirect <- 2 * (1 - pnorm(abs(z)))
+
+    data.frame(
+      path_a_coef = a, path_a_pval = p_a,
+      path_b_coef = b, path_b_pval = p_b,
+      indirect_effect = indirect, indirect_se = se_indirect,
+      indirect_CI_low = indirect - 1.96 * se_indirect,
+      indirect_CI_high = indirect + 1.96 * se_indirect,
+      indirect_pval = p_indirect,
+      total_effect = c_total, total_pval = p_total,
+      direct_effect = c_prime, direct_pval = p_cprime,
+      n_obs = nrow(df), n_subjects = length(unique(df$SubjectID)),
+      stringsAsFactors = FALSE
+    )
+  }, error = function(e) NULL)
+
+  return(result)
+}
+
+##############################
+### Run all 313 mediation_combos
+##############################
+
+results_list <- list()
+
+for (i in 1:nrow(mediation_combos)) {
+  res <- run_mediation(data,
+                       x_var = mediation_combos$diet_variable[i],
+                       m_var = mediation_combos$mediator[i],
+                       y_var = mediation_combos$outcome[i])
+  if (!is.null(res)) {
+    res$diet_component <- mediation_combos$diet_component[i]
+    res$diet_variable  <- mediation_combos$diet_variable[i]
+    res$mediator       <- mediation_combos$mediator[i]
+    res$outcome        <- mediation_combos$outcome[i]
+    results_list[[length(results_list) + 1]] <- res
+  }
+}
+
+results_df <- bind_rows(results_list)
+results_df$indirect_pval_BH <- p.adjust(results_df$indirect_pval, method = "BH")
+
+nrow(results_df) # 313
+sum(results_df$indirect_pval < 0.05) # 6 significant
+
+##############################
+### Significant mediations
+##############################
+
+sig <- results_df %>%
+  filter(indirect_pval < 0.05) %>%
+  arrange(indirect_pval) %>%
+  mutate(mediator_clean = gsub("^genus_", "", mediator))
+
+sig %>% select(diet_component, mediator_clean, outcome, indirect_effect, indirect_pval)
+
+write.csv(results_df,
+          file.path(output_dir, "mediation_multilevel_results_R_all_final.csv"),
+          row.names = FALSE)
+write.csv(sig,
+          file.path(output_dir, "mediation_multilevel_results_R_significant_final.csv"),
+          row.names = FALSE)
